@@ -1,12 +1,10 @@
 #ifndef MPC_UTILS_HPP
 #define MPC_UTILS_HPP
-
 #include <casadi/casadi.hpp>
 #include <vector>
 #include <string>
 #include <map>
 #include "robot_model.hpp"
-
 
 class MPCUtils {
 public:
@@ -14,10 +12,10 @@ public:
         std::vector<::casadi::DM> q_ref;                        // Position reference [N+1]
         std::vector<::casadi::DM> v_ref;                        // Velocity reference [N+1]
         std::vector<::casadi::DM> a_ref;                        // Acceleration reference [N]
-        std::vector<std::vector<::casadi::DM>> ee_pos_ref;      // [N+1][n_ee]
-        std::vector<std::vector<::casadi::DM>> ee_ori_ref;      // [N+1][n_ee]
         std::vector<::casadi::DM> zmp_ref;                      // ZMP reference [N]
         std::vector<::casadi::DM> com_ref;                      // CoM reference [N+1]
+        std::vector<std::vector<::casadi::DM>> ee_pos_ref;      // [N+1][n_ee]
+        std::vector<std::vector<::casadi::DM>> ee_ori_ref;      // [N+1][n_ee]
     };
 
     using ContactSchedule = std::vector<std::vector<bool>>;
@@ -32,14 +30,14 @@ public:
                    const ::casadi::DM& lbg, const ::casadi::DM& ubg);
 
     ::casadi::SX buildCost(
-        const ReferenceTrajectories& refs,
         const ::casadi::SX& Qq,          // Position cost
         const ::casadi::SX& Qv,          // Velocity cost  
         const ::casadi::SX& Ra,          // Acceleration cost
         const ::casadi::SX& Qf,          // Terminal cost
         const ::casadi::SX& Wee,         // End-effector cost
         const ::casadi::SX& Wzmp,        // ZMP cost
-        const ::casadi::SX& W_tau
+        const ::casadi::SX& Wcom,        // CoM cost
+        const ::casadi::SX& W_tau        // Torque Regularization cost
     ) const;
 
     ::casadi::SX buildConstraints(
@@ -67,7 +65,7 @@ public:
     );
 
 
-    // Symbolic helper functions (based on acceleration optimization)
+    // Symbolic helper functions 
     ::casadi::SX ee_pos_sym(int k, const std::string& ee_name) const;
     ::casadi::SX ee_ori_sym(int k, const std::string& ee_name) const;
     ::casadi::SX com_position_sym(int k) const;
@@ -96,7 +94,16 @@ private:
     std::vector<::casadi::SX> v_sym_;    // States (dependent variables)  
     std::vector<::casadi::SX> a_sym_;    // MAIN OPTIMIZATION VARIABLES
     std::vector<::casadi::SX> f_sym_;    // MAIN OPTIMIZATION VARIABLES
-    
+
+    //reference symbolic variable (parameters for solver)
+    std::vector<::casadi::SX> q_ref_sym_;
+    std::vector<::casadi::SX> v_ref_sym_;
+    std::vector<::casadi::SX> a_ref_sym_;
+    std::vector<::casadi::SX> zmp_ref_sym_;
+    std::vector<::casadi::SX> com_ref_sym_;
+    std::vector<std::vector<::casadi::SX>> ee_pos_ref_sym_;
+    std::vector<std::vector<::casadi::SX>> ee_ori_ref_sym_;
+
     ContactSchedule contact_schedule_;
     ::casadi::DM lbx_, ubx_, lbg_, ubg_;
     ::casadi::Function solver_;

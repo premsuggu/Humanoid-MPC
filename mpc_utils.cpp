@@ -23,9 +23,10 @@ MPCUtils::MPCUtils(int N, int nq, int nv, int n_ee, double dt,
 void MPCUtils::IntegrationFunction() {
     using namespace pinocchio;
     
-    // Create symbolic variables for CasADi
+    // Create symbolic variables
     ::casadi::SX cs_q = ::casadi::SX::sym("q", nq_);
-    ::casadi::SX cs_v_dt = ::casadi::SX::sym("v_dt", nv_);  // v * dt
+    ::casadi::SX cs_v = ::casadi::SX::sym("v", nv_);  // Just velocity, not v*dt
+    ::casadi::SX cs_dt = ::casadi::SX::sym("dt", 1);  // Time step as parameter
     
     // Convert to Pinocchio autodiff types
     typedef ::casadi::SX ADScalar;
@@ -36,19 +37,19 @@ void MPCUtils::IntegrationFunction() {
     const Model& model = robot_model_->getModel();
     ADModel ad_model = model.cast<ADScalar>();
     
-    // Convert CasADi SX to Pinocchio AD types
     ConfigVectorAD q_ad(nq_);
-    TangentVectorAD v_dt_ad(nv_);
+    TangentVectorAD v_ad(nv_);
     
     for (int i = 0; i < nq_; ++i) {
         q_ad[i] = cs_q(i);
     }
     for (int i = 0; i < nv_; ++i) {
-        v_dt_ad[i] = cs_v_dt(i);
+        v_ad[i] = cs_v(i);
     }
     
-    // Perform integration using Pinocchio
+    // Perform integration: q_next = integrate(q, v * dt)
     ConfigVectorAD q_next_ad(nq_);
+    TangentVectorAD v_dt_ad = v_ad * cs_dt(0);  // Scale velocity by dt inside
     integrate(ad_model, q_ad, v_dt_ad, q_next_ad);
     
     // Convert result back to CasADi SX
@@ -57,9 +58,9 @@ void MPCUtils::IntegrationFunction() {
         cs_q_next(i) = q_next_ad[i];
     }
     
-    // Create CasADi function
+    // Create CasADi function with dt as parameter
     casadi_integrate_ = ::casadi::Function("integrate", 
-                                          {cs_q, cs_v_dt}, 
+                                          {cs_q, cs_v, cs_dt}, 
                                           {cs_q_next});
 }
 
@@ -68,6 +69,28 @@ void MPCUtils::createSymbolicVariables() {
     v_sym_.resize(N_ + 1);  
     a_sym_.resize(N_);      
     f_sym_.resize(N_);      
+
+    //PARAMETERS
+    q_ref_sym_.clear(); v_ref_sym_.clear(); a_ref_sym_.clear();
+    zmp_ref_sym_.clear(); com_ref_sym_.clear();
+    ee_pos_ref_sym_.clear(); ee_ori_ref_sym_.clear();
+
+    for (int k = 0; k <= N_; ++k) {
+        q_ref_sym_.push_back(::casadi::SX::sym("q_ref_" + std::to_string(k), nq_));
+        v_ref_sym_.push_back(::casadi::SX::sym("v_ref_" + std::to_string(k), nv_));
+        com_ref_sym_.push_back(::casadi::SX::sym("com_ref_" + std::to_string(k), 3));
+    }
+    for (int k = 0; k < N_; ++k) {
+        a_ref_sym_.push_back(::casadi::SX::sym("a_ref_" + std::to_string(k), nv_));
+        zmp_ref_sym_.push_back(::casadi::SX::sym("zmp_ref_" + std::to_string(k), 2));
+        std::vector<::casadi::SX> ee_pos_k, ee_ori_k;
+        for (int ee = 0; ee < n_ee_; ++ee) {
+            ee_pos_k.push_back(::casadi::SX::sym("ee_pos_ref_" + std::to_string(k) + "_" + std::to_string(ee), 3));
+            ee_ori_k.push_back(::casadi::SX::sym("ee_ori_ref_" + std::to_string(k) + "_" + std::to_string(ee), 4));
+        }
+        ee_pos_ref_sym_.push_back(ee_pos_k);
+        ee_ori_ref_sym_.push_back(ee_ori_k);
+    }
 
     // Accelerations & contact forces (optimization variables)
     int max_contacts = n_ee_;
@@ -84,8 +107,12 @@ void MPCUtils::createSymbolicVariables() {
     for (int k = 0; k < N_; ++k) {
         v_sym_[k+1] = v_sym_[k] + dt_ * a_sym_[k];
         
-        ::casadi::SX v_dt = v_sym_[k+1] * dt_;
-        q_sym_[k+1] = casadi_integrate_(std::vector<::casadi::SX>{q_sym_[k], v_dt})[0];
+        // CORRECT: Pass velocity and dt separately
+        q_sym_[k+1] = casadi_integrate_(std::vector<::casadi::SX>{
+            q_sym_[k], 
+            v_sym_[k+1], 
+            ::casadi::SX(dt_)
+        })[0];
     }
 }
 
@@ -257,38 +284,39 @@ void MPCUtils::createDynamicsFunctions() {
 
 ::casadi::SX MPCUtils::ee_ori_sym(int k, const std::string& ee_name) const {
     using namespace pinocchio;
-    
+
     typedef ::casadi::SX ADScalar;
     typedef ModelTpl<ADScalar> ADModel;
     typedef ADModel::Data ADData;
-    
+
     const Model& model = robot_model_->getModel();
     ADModel ad_model = model.cast<ADScalar>();
     ADData ad_data(ad_model);
-    
+
     typedef ADModel::ConfigVectorType ConfigVectorAD;
     ConfigVectorAD q_ad(nq_);
     for (int i = 0; i < nq_; ++i) {
         q_ad[i] = q_sym_[k](i);
     }
-    
+
     forwardKinematics(ad_model, ad_data, q_ad);
     updateFramePlacements(ad_model, ad_data);
-    
+
     FrameIndex frame_id = robot_model_->getFrameId(ee_name);
     auto rot = ad_data.oMf[frame_id].rotation();
-    
-    // Convert to quaternion (simplified)
+
+    // Pinocchio provides quaternion conversion for Eigen matrices, but not directly for CasADi SX.
+    // So, use the manual conversion as you had:
     ::casadi::SX trace = rot(0,0) + rot(1,1) + rot(2,2);
     ::casadi::SX quat = ::casadi::SX::zeros(4, 1);
-    
+
     ::casadi::SX w = ::casadi::SX::sqrt(1.0 + trace) / 2.0;
     ::casadi::SX x = (rot(2,1) - rot(1,2)) / (4.0 * w);
     ::casadi::SX y = (rot(0,2) - rot(2,0)) / (4.0 * w);
     ::casadi::SX z = (rot(1,0) - rot(0,1)) / (4.0 * w);
-    
+
     quat(0) = w; quat(1) = x; quat(2) = y; quat(3) = z;
-    return quat;
+    return quat; // [w, x, y, z]
 }
 
 
@@ -403,59 +431,61 @@ void MPCUtils::createDynamicsFunctions() {
 
 // Build cost function
 ::casadi::SX MPCUtils::buildCost(
-    const ReferenceTrajectories& refs,
     const ::casadi::SX& Qq,
     const ::casadi::SX& Qv,
     const ::casadi::SX& Ra,
     const ::casadi::SX& Qf,
     const ::casadi::SX& Wee,
     const ::casadi::SX& Wzmp,
+    const ::casadi::SX& Wcom,
     const ::casadi::SX& W_tau
 ) const {
-    ::casadi::SX cost = 0;
-    
+    ::casadi::SX cost = 0;    
     std::cout << "Building cost function..." << std::endl;
-    
     // Running costs
     for (int k = 0; k < N_; ++k) {
         // 1. Position tracking cost
-        ::casadi::SX q_error = q_sym_[k] - ::casadi::SX(refs.q_ref[k]);
+        ::casadi::SX q_error = q_sym_[k] - ::casadi::SX(q_ref_sym_[k]);
         cost += ::casadi::SX::mtimes({q_error.T(), Qq, q_error});
         
         // 2. Velocity tracking cost
-        ::casadi::SX v_error = v_sym_[k] - ::casadi::SX(refs.v_ref[k]);
+        ::casadi::SX v_error = v_sym_[k] - ::casadi::SX(v_ref_sym_[k]);
         cost += ::casadi::SX::mtimes({v_error.T(), Qv, v_error});
         
         // 3. Acceleration regularization (main optimization variables)
-        ::casadi::SX a_error = a_sym_[k] - ::casadi::SX(refs.a_ref[k]);
+        ::casadi::SX a_error = a_sym_[k] - ::casadi::SX(a_ref_sym_[k]);
         cost += ::casadi::SX::mtimes({a_error.T(), Ra, a_error});
         
         // 4. End-effector tracking costs
         for (int ee = 0; ee < n_ee_; ++ee) {
             // Position tracking
-            ::casadi::SX ee_pos_error = ee_pos_sym(k, ee_names_[ee]) - ::casadi::SX(refs.ee_pos_ref[k][ee]);
+            ::casadi::SX ee_pos_error = ee_pos_sym(k, ee_names_[ee]) - ::casadi::SX(ee_pos_ref_sym_[k][ee]);
             cost += ::casadi::SX::mtimes({ee_pos_error.T(), Wee, ee_pos_error});
             
-            // Orientation tracking (simplified)
-            ::casadi::SX ee_ori_error = ee_ori_sym(k, ee_names_[ee]) - ::casadi::SX(refs.ee_ori_ref[k][ee]);
+            // Orientation tracking 
+            ::casadi::SX ee_ori_error = ee_ori_sym(k, ee_names_[ee]) - ::casadi::SX(ee_ori_ref_sym_[k][ee]);
             cost += 0.1 * ::casadi::SX::mtimes({ee_ori_error.T(), ee_ori_error});
         }
         
         // 5. ZMP tracking cost
-        // ::casadi::SX zmp_error = zmp_sym(k) - ::casadi::SX(refs.zmp_ref[k]);
-        // cost += ::casadi::SX::mtimes({zmp_error.T(), Wzmp, zmp_error});
+        ::casadi::SX zmp_error = zmp_sym(k) - ::casadi::SX(zmp_ref_sym_[k]);
+        cost += ::casadi::SX::mtimes({zmp_error.T(), Wzmp, zmp_error});
+
+        // 6. CoM tracking cost 
+        ::casadi::SX com_error = com_position_sym(k) - ::casadi::SX(com_ref_sym_[k]);
+        cost += ::casadi::SX::mtimes({com_error.T(), Wcom, com_error});
+
 
         // Torque Regularization
         ::casadi::SX tau = torque_sym(k);
         cost += ::casadi::SX::mtimes({tau.T(),W_tau ,tau});
-
     }
     
     // Terminal cost
-    ::casadi::SX q_final_error = q_sym_[N_] - ::casadi::SX(refs.q_ref[N_]);
-    ::casadi::SX v_final_error = v_sym_[N_] - ::casadi::SX(refs.v_ref[N_]);
+    ::casadi::SX q_final_error = q_sym_[N_] - ::casadi::SX(q_ref_sym_[N_]);
+    ::casadi::SX v_final_error = v_sym_[N_] - ::casadi::SX(v_ref_sym_[N_]);
     cost += ::casadi::SX::mtimes({q_final_error.T(), Qf, q_final_error});
-    cost += ::casadi::SX::mtimes({v_final_error.T(), Qf, v_final_error});
+    cost += ::casadi::SX::mtimes({v_final_error.T(), 5*Qv, v_final_error});
     
     std::cout << "Cost function built successfully" << std::endl;
     return cost;
@@ -503,11 +533,11 @@ void MPCUtils::createDynamicsFunctions() {
         }
 
         // 4. ZMP constraints (INEQUALITY)
-        // ::casadi::SX zmp = zmp_sym(k);
-        // constraints.push_back(zmp(0) - zmp_x_min);  // zmp_x >= zmp_x_min
-        // constraints.push_back(zmp_x_max - zmp(0));  // zmp_x <= zmp_x_max
-        // constraints.push_back(zmp(1) - zmp_y_min);  // zmp_y >= zmp_y_min
-        // constraints.push_back(zmp_y_max - zmp(1));  // zmp_y <= zmp_y_max
+        ::casadi::SX zmp = zmp_sym(k);
+        constraints.push_back(zmp(0) - zmp_x_min);  // zmp_x >= zmp_x_min
+        constraints.push_back(zmp_x_max - zmp(0));  // zmp_x <= zmp_x_max
+        constraints.push_back(zmp(1) - zmp_y_min);  // zmp_y >= zmp_y_min
+        constraints.push_back(zmp_y_max - zmp(1));  // zmp_y <= zmp_y_max
         
         // 5. Swing foot clearance constraints
         for (int ee = 0; ee < 2; ++ee) {  // Only feet (first 2 end-effectors)
@@ -635,23 +665,29 @@ void MPCUtils::setupSolver(const ::casadi::SX& cost, const ::casadi::SX& constra
 
     // Parameters = initial conditions + references
     std::vector<::casadi::SX> params = {q_sym_[0], v_sym_[0]};
-    
-    for (int k = 0; k <= N_; ++k) {
-        params.push_back(::casadi::SX::sym("q_ref_" + std::to_string(k), nq_));
-        params.push_back(::casadi::SX::sym("v_ref_" + std::to_string(k), nv_));
-    }
+    std::vector<::casadi::SX> param_vec;
+    param_vec.push_back(q_sym_[0]);
+    param_vec.push_back(v_sym_[0]);
+    for (int k = 0; k <= N_; ++k) param_vec.push_back(q_ref_sym_[k]);
+    for (int k = 0; k <= N_; ++k) param_vec.push_back(v_ref_sym_[k]);
+    for (int k = 0; k < N_; ++k) param_vec.push_back(a_ref_sym_[k]);
+    for (int k = 0; k < N_; ++k) param_vec.push_back(zmp_ref_sym_[k]);
+    for (int k = 0; k <= N_; ++k) param_vec.push_back(com_ref_sym_[k]);
+
     for (int k = 0; k < N_; ++k) {
-        params.push_back(::casadi::SX::sym("a_ref_" + std::to_string(k), nv_));
-        params.push_back(::casadi::SX::sym("zmp_ref_" + std::to_string(k), 2));
         for (int ee = 0; ee < n_ee_; ++ee) {
-            params.push_back(::casadi::SX::sym("ee_pos_ref_" + std::to_string(k) + "_" + std::to_string(ee), 3));
-            params.push_back(::casadi::SX::sym("ee_ori_ref_" + std::to_string(k) + "_" + std::to_string(ee), 4));
+            param_vec.push_back(ee_pos_ref_sym_[k][ee]);
         }
     }
-    
-    ::casadi::SX p = ::casadi::SX::vertcat(params);
-    
-    // Create NLP
+    for (int k = 0; k < N_; ++k) {
+        for (int ee = 0; ee < n_ee_; ++ee) {
+            param_vec.push_back(ee_ori_ref_sym_[k][ee]);
+        }
+    }
+
+    // 5. Now vertcat
+    ::casadi::SX p = ::casadi::SX::vertcat(param_vec);
+    // Create NLP problem
     ::casadi::SXDict nlp;
     nlp["x"] = x_opt;      // symbolic accelerations
     nlp["p"] = p;          // Parameters (initial states (q0, v0) + reference trajectories)
@@ -682,35 +718,31 @@ void MPCUtils::setupSolver(const ::casadi::SX& cost, const ::casadi::SX& constra
     const ::casadi::DM& v0,
     const ReferenceTrajectories& refs
 ) {
-    std::cout << "Solving MPC..." << std::endl;
-    
+    std::cout << "Solving nlp Problem..." << std::endl;
     // Prepare parameter vector
     std::vector<::casadi::DM> param_values;
-    param_values.push_back(q0);  // Initial position
-    param_values.push_back(v0);  // Initial velocity
-    
-    // Add reference trajectories
-    for (int k = 0; k <= N_; ++k) {
-        param_values.push_back(refs.q_ref[k]);
-        param_values.push_back(refs.v_ref[k]);
-    }
-    for (int k = 0; k < N_; ++k) {
-        param_values.push_back(refs.a_ref[k]);
-        param_values.push_back(refs.zmp_ref[k]);
-        for (int ee = 0; ee < n_ee_; ++ee) {
+    param_values.push_back(q0);
+    param_values.push_back(v0);
+
+    for (int k = 0; k <= N_; ++k) param_values.push_back(refs.q_ref[k]);
+    for (int k = 0; k <= N_; ++k) param_values.push_back(refs.v_ref[k]);
+    for (int k = 0; k < N_; ++k) param_values.push_back(refs.a_ref[k]);
+    for (int k = 0; k < N_; ++k) param_values.push_back(refs.zmp_ref[k]);
+    for (int k = 0; k <= N_; ++k) param_values.push_back(refs.com_ref[k]);
+
+    for (int k = 0; k < N_; ++k)
+        for (int ee = 0; ee < n_ee_; ++ee)
             param_values.push_back(refs.ee_pos_ref[k][ee]);
+    for (int k = 0; k < N_; ++k)
+        for (int ee = 0; ee < n_ee_; ++ee)
             param_values.push_back(refs.ee_ori_ref[k][ee]);
-        }
-    }
-    
+
     ::casadi::DM p_val = ::casadi::DM::vertcat(param_values);
     
     int total_accel_vars = N_ * nv_;
     int total_force_vars = N_ * (6 * n_ee_);
-    
-    // Initial guess for BOTH accelerations and contact forces
+    // Initial guess for BOTH accelerations and contact forces  - **need to enforce warm start
     ::casadi::DM x0 = ::casadi::DM::zeros(total_accel_vars + total_force_vars, 1);
-    
     // Solve
     ::casadi::DMDict arg;
     arg["x0"] = x0;
@@ -723,12 +755,10 @@ void MPCUtils::setupSolver(const ::casadi::SX& cost, const ::casadi::SX& constra
     try {
         ::casadi::DMDict res = solver_(arg);
         ::casadi::DM solution = res.at("x");
-        
-        std::cout << "MPC solved successfully!" << std::endl;
         return solution;
         
     } catch (const std::exception& e) {
-        std::cerr << "MPC solve failed: " << e.what() << std::endl;
+        std::cerr << "solve failed: " << e.what() << std::endl;
         return ::casadi::DM::zeros(N_ * nv_, 1);
     }
 }

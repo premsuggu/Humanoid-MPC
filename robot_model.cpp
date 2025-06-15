@@ -11,7 +11,7 @@
 RobotModel::RobotModel(const std::string& urdf_path, const std::vector<std::string>& ee_names)
     : ee_names_(ee_names)
 {
-    pinocchio::urdf::buildModel(urdf_path, model_);
+    pinocchio::urdf::buildModel(urdf_path, pinocchio::JointModelFreeFlyer(), model_);
     data_ = pinocchio::Data(model_);
 
     lower_limits_.resize(model_.nq);
